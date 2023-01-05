@@ -1,0 +1,217 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+
+Description: Demo Timestream to Glue job using JDBC
+
+# To do
+# - Minimise security permissions
+# - Try and exponential backoff for writing the timestream events
+# - Option for end points / VPC
+
+Parameters:
+
+  TimestreamDBName: 
+    Type: String
+    Default: DemoDB
+
+  TimestreamTableName:
+    Type: String
+    Default: DevOps
+
+  RecordCount:
+    Type: Number
+    Default: 1000
+
+  TimestreamJDBCDriverPath:
+    Type: String
+    Default: https://github.com/awslabs/amazon-timestream-driver-jdbc/releases/download/1.0.2/
+
+  TimestreamJDBCDriverFileName:
+    Type: String
+    Default: amazon-timestream-jdbc-1.0.2-shaded.jar 
+
+  GlueDBName:
+    Type: String
+    Default: demo-db
+
+  AthenaWorkgroupName:
+    Type: String
+    Default: demo-workgroup
+
+Resources:
+  TimestreamDB:
+    Type: AWS::Timestream::Database
+    Properties:
+      DatabaseName: !Ref TimestreamDBName
+
+  TimestreamDBInfraTable:
+    Type: AWS::Timestream::Table
+    Properties:
+      DatabaseName: !Ref TimestreamDB
+      TableName: !Ref TimestreamTableName
+
+  LambdaPopulateTable:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/populateTable
+      Handler: app.lambda_handler
+      Runtime: python3.9 
+      MemorySize: 128
+      Timeout: 300
+      Environment:
+        Variables:
+          DbName: !Ref TimestreamDBName
+          TableName: !Ref TimestreamTableName
+          RecordCount: !Ref RecordCount
+      Policies:
+        - AmazonTimestreamFullAccess
+
+  CustomPopulateTable:
+    DependsOn: 
+      - LambdaPopulateTable
+      - TimestreamDBInfraTable
+    Type: Custom::PopulateTable
+    Properties: 
+      ServiceToken: !GetAtt LambdaPopulateTable.Arn
+
+  BucketDriver:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub timestream-jdbc-driver-bucket-${AWS::Region}-${AWS::AccountId}
+
+  LambdaUploadDriver:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/uploadDriver
+      Handler: app.lambda_handler
+      Runtime: python3.9 
+      MemorySize: 128
+      Timeout: 300
+      Environment:
+        Variables:
+          TimestreamJDBCDriverPath: !Ref TimestreamJDBCDriverPath
+          TimestreamJDBCDriverFileName: !Ref TimestreamJDBCDriverFileName
+          TargetBucket: !Ref BucketDriver
+      Policies:
+        - S3FullAccessPolicy:
+            BucketName: !Ref BucketDriver
+
+  CustomUploadDriver:
+    DependsOn: 
+      - LambdaUploadDriver
+      - BucketDriver
+    Type: Custom::UploadDriver
+    Properties: 
+      ServiceToken: !GetAtt LambdaUploadDriver.Arn
+
+  SecretGlueConnection:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      SecretString: '{"AwsCredentialsProviderClass":"InstanceProfileCredentialsProvider"}'
+  
+  BucketGlueOutput:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub timestream-glue-output-bucket-${AWS::Region}-${AWS::AccountId}
+
+  LambdaEmptyBucketGlueOutput:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/emptyBucket
+      Handler: app.lambda_handler
+      Runtime: python3.9 
+      Timeout: 300
+      Environment:
+        Variables:
+          TargetBucket: !Ref BucketGlueOutput
+      Policies:
+        - S3FullAccessPolicy:
+            BucketName: !Ref BucketGlueOutput
+
+  CustomEmptyBucketGlueOutput:
+    DependsOn: 
+      - LambdaEmptyBucketGlueOutput
+      - BucketGlueOutput
+    Type: Custom::EmptyBucketGlueOutput
+    Properties: 
+      ServiceToken: !GetAtt LambdaEmptyBucketGlueOutput.Arn
+
+  RoleTimestreamToS3Glue:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: "glue.amazonaws.com"
+            Action:
+              - sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: PolicyTimestreamToS3Glue
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref SecretGlueConnection
+              - Effect: Allow
+                Action: S3:PutObject
+                Resource: !Sub ${BucketGlueOutput.Arn}/*
+              - Effect: Allow
+                Action: S3:GetObject
+                Resource: !Sub ${BucketDriver.Arn}/${TimestreamJDBCDriverFileName}
+              - Effect: Allow
+                Action: 
+                  - timestream:DescribeEndpoints
+                  - timestream:SelectValues
+                Resource: '*'
+              - Effect: Allow
+                Action: timestream:Select
+                Resource: !GetAtt TimestreamDBInfraTable.Arn
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+
+  GlueCatalogueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Ref GlueDBName
+
+  AthenaDemoWorkgroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: !Ref AthenaWorkgroupName
+      RecursiveDeleteOption: true
+      WorkGroupConfiguration:
+        ResultConfiguration:
+          OutputLocation: !Sub s3://${BucketAthenaQueryResults}/
+
+  BucketAthenaQueryResults:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub athena-query-output-bucket-${AWS::Region}-${AWS::AccountId}
+        
+  LambdaEmptyBucketAthenaQueryResults:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/emptyBucket
+      Handler: app.lambda_handler
+      Runtime: python3.9 
+      Timeout: 300
+      Environment:
+        Variables:
+          TargetBucket: !Ref BucketAthenaQueryResults
+      Policies:
+        - S3FullAccessPolicy:
+            BucketName: !Ref BucketAthenaQueryResults
+
+  CustomEmptyBucketAthenaQueryResults:
+    DependsOn: 
+      - LambdaEmptyBucketAthenaQueryResults
+      - BucketAthenaQueryResults
+    Type: Custom::EmptyBucketAthenaQueryResults
+    Properties: 
+      ServiceToken: !GetAtt LambdaEmptyBucketAthenaQueryResults.Arn
