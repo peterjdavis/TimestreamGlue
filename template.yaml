@@ -3,11 +3,6 @@ Transform: AWS::Serverless-2016-10-31
 
 Description: Demo Timestream to Glue job using JDBC
 
-# To do
-# - Minimise security permissions
-# - Try and exponential backoff for writing the timestream events
-# - Option for end points / VPC
-
 Parameters:
 
   TimestreamDBName: 
